@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Virtual environments
+.venv*/
+venv/
+
+# Test and tool caches
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Secrets. The integration tests read ANTHROPIC_API_KEY from here.
+.env
+
+# Run output
+logs/
+*.jsonl
+
+# OS
+.DS_Store

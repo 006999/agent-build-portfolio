@@ -1,0 +1,9 @@
+invoice_id,client,amount,currency,issue_date,status
+INV-1041,Example Systems Ltd,12500.00,USD,2026-05-02,paid
+INV-1042,Sample Logistics Ltd,3150.50,GBP,2026-06-01,paid
+INV-1043,Placeholder Freight Ltd,4820.00,EUR,2026-06-14,unpaid
+INV-1044,Example Systems Ltd,780.00,USD,2026-06-19,unpaid
+INV-1045,Fictional & Partners,22000.00,EUR,2026-06-30,unpaid
+INV-1046,Sample Logistics Ltd,9640.75,GBP,2026-07-03,paid
+INV-1047,Demo Mill Ltd,1490.00,USD,2026-07-11,unpaid
+INV-1048,Fictional & Partners,5375.20,EUR,2026-07-22,unpaid
