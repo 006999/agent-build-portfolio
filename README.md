@@ -1,5 +1,7 @@
 # agent-build-portfolio
 
+[![tests](https://github.com/006999/agent-build-portfolio/actions/workflows/tests.yml/badge.svg)](https://github.com/006999/agent-build-portfolio/actions/workflows/tests.yml)
+
 A single tool-using agent loop written by hand in Python on the Anthropic SDK, with guardrails, an audit log, and a mutation harness that checks the tests catch real faults.
 
 This is a public subset of a larger private build. The parts that touched real business data were left out; what is here runs on its own.
