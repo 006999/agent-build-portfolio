@@ -11,7 +11,7 @@ This is a public subset of a larger private build. The parts that touched real b
 ## What it demonstrates
 
 - **A hand-written agent loop, no framework.** `src/agent.py` sends the request, runs any tools the model asks for, feeds the results back, and repeats until the model signals it is done or a limit is hit.
-- **Every run ends with a named reason.** `src/agent.py` defines `StopReason`: complete, max_cycles, blocked_input, blocked_output, truncated, refused, tool_failed, unknown_tool. `tests/test_agent.py` covers each path with a fake client.
+- **Every run that returns ends with a named reason.** `src/agent.py` defines `StopReason`: complete, max_cycles, blocked_input, blocked_output, truncated, refused, tool_failed, unknown_tool. `tests/test_agent.py` covers each path with a fake client. An error from the API call or a guardrail is not given a reason: it is logged and raised again.
 - **Input and output guardrails, tested both ways.** `src/guardrails.py` checks the task before the model sees it (empty, oversized, known injection phrases) and checks replies afterwards (banned words). `tests/test_guardrails.py` tests every guardrail with text it must stop and text it must let through, and pins two known misses as tests.
 - **Nothing carries over between runs.** `tests/test_memory.py` checks that a second run sends nothing from the first, writes nothing to disk, and that the invoice tool rereads its file rather than caching it.
 - **An audit log you can rebuild a run from.** `src/audit.py` writes one JSON line per event. `scripts/read_log.py` splits a log file into runs and rebuilds each one. `tests/test_logging.py` compares the rebuild against what the loop actually returned, including for runs that crash.
