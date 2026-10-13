@@ -4,6 +4,8 @@
 
 A single tool-using agent loop written by hand in Python on the Anthropic SDK, with guardrails, an audit log, and a mutation harness that checks the tests catch real faults.
 
+How it works: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
+
 This is a public subset of a larger private build. The parts that touched real business data were left out; what is here runs on its own.
 
 ## What it demonstrates
