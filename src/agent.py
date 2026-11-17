@@ -72,8 +72,9 @@ MAX_TOKENS = 1024
 # loop never sees, so one run can reach ~80 searches across two models. The
 # honest instrument is a token budget, and the data is already captured -
 # response.usage comes back on every call below and has been logged per cycle
-# on the reply event since Day 5. Nothing reads it back to enforce a limit,
-# which is the actual gap: the measurement exists, the budget does not.
+# on the reply event since Day 5. run_agent's max_tokens_per_run now reads it
+# to enforce a limit, but only when a caller sets one: it is off by default,
+# so this ceiling is still the only bound on a run that does not.
 MAX_CYCLES_CEILING = 4 * DEFAULT_MAX_CYCLES
 
 
@@ -111,6 +112,10 @@ class StopReason(str, Enum):
     # prompt or the registry.
     TOOL_FAILED = "tool_failed"
     UNKNOWN_TOOL = "unknown_tool"
+    # Token budget. The run's input + output tokens, summed over every reply,
+    # went above the caller's max_tokens_per_run. Only possible when a budget
+    # was set.
+    BUDGET_EXCEEDED = "budget_exceeded"
 
 
 # Day 10. The api_stop_reasons that end a run, and the reason each one maps to.
@@ -218,6 +223,33 @@ def _block_to_dict(block) -> dict:
     raise ValueError(f"Unsupported content block type: {block.type!r}")
 
 
+def _reply_tokens(response) -> int:
+    """Input + output tokens of one reply, for the token budget.
+
+    Only called when a budget is set. Fails closed: if either count is missing
+    or is not a whole number, the budget cannot be enforced, so this raises
+    rather than counting the reply as free. The raise happens inside the loop
+    body's try, so it is logged as an error event and re-raised, the same way
+    _block_to_dict treats a reply it cannot read.
+
+    `bool` is refused on purpose: True is an int in Python, and a count that
+    arrived as True is a bug upstream, not one token.
+    """
+    usage = getattr(response, "usage", None)
+    counts = (
+        getattr(usage, "input_tokens", None),
+        getattr(usage, "output_tokens", None),
+    )
+    for count in counts:
+        if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+            raise ValueError(
+                "reply has no usable token counts "
+                f"(input_tokens={counts[0]!r}, output_tokens={counts[1]!r}); "
+                "cannot enforce max_tokens_per_run"
+            )
+    return counts[0] + counts[1]
+
+
 def _first_block(guardrails, text: str) -> tuple[str, str] | None:
     """The name and reason of the first guardrail that refuses `text`.
 
@@ -244,6 +276,7 @@ def run_agent(
     model: str = DEFAULT_MODEL,
     client=None,
     on_event=_ignore,
+    max_tokens_per_run: int | None = None,
 ) -> AgentResult:
     """Run the agent until the task is complete, blocked, cut off, or out of cycles.
 
@@ -265,11 +298,31 @@ def run_agent(
     `on_event` is called as `on_event(event_type, **fields)` and its return value
     is ignored. Every event carries `actor`, which is "agent" or "guardrail" and
     nothing else. A tool is not a third actor - the agent called it.
+
+    `max_tokens_per_run` is an optional token budget: input + output tokens,
+    read from each reply's usage and summed over the run. None (the default)
+    switches it off, and the loop then behaves exactly as it did without it.
+    When set, the total is checked after each reply. A total equal to the
+    budget is allowed; a total above it ends the run as BUDGET_EXCEEDED. The
+    check comes after the reply has been paid for, so a run can go over the
+    budget by up to one reply's tokens. It cannot know a reply's cost before
+    the reply arrives. A reply with no usable counts is not counted as zero:
+    with a budget set, the run raises (see _reply_tokens).
     """
     if max_cycles < 1:
         raise ValueError("max_cycles must be at least 1")
     if max_cycles > MAX_CYCLES_CEILING:
         raise ValueError(f"max_cycles must be at most {MAX_CYCLES_CEILING}")
+    # Same rule as max_cycles: argument validation, before run_start, so a bad
+    # value produces an empty log. bool is refused for the reason given in
+    # _reply_tokens, and a string from a config file is refused rather than
+    # compared.
+    if max_tokens_per_run is not None and (
+        not isinstance(max_tokens_per_run, int)
+        or isinstance(max_tokens_per_run, bool)
+        or max_tokens_per_run < 1
+    ):
+        raise ValueError("max_tokens_per_run must be None or a whole number of at least 1")
 
     # After the two raises above and before the input guardrails below. Those
     # raises are argument validation - a programmer error, not a run that
@@ -363,6 +416,8 @@ def run_agent(
     stop_reason = StopReason.MAX_CYCLES
     final_answer = ""
     cycles = 0
+    # Running total for the token budget. Only added to when a budget is set.
+    tokens_used = 0
 
     for cycle in range(1, max_cycles + 1):
         cycles = cycle
@@ -505,6 +560,44 @@ def run_agent(
                     final_answer=final_answer,
                     conversation=messages,
                 )
+
+            # Token budget. Same position rules as the API stop above, and
+            # after it:
+            #
+            # After the reply event, so the token counts that tripped it are in
+            # the log before the run ends.
+            #
+            # After the output guardrail and the API stop, so a reply that is
+            # also blocked, cut off or refused keeps that more specific reason.
+            #
+            # Before `final_answer = reply`, tool dispatch and the sentinel, so
+            # the reply that went over budget never becomes the answer, never
+            # runs a tool, and cannot claim completion. It stays in the
+            # conversation, like a blocked or truncated one, so it is on record.
+            if max_tokens_per_run is not None:
+                tokens_used += _reply_tokens(response)
+                if tokens_used > max_tokens_per_run:
+                    on_event(
+                        "budget_exceeded",
+                        actor="agent",
+                        cycle=cycle,
+                        max_tokens_per_run=max_tokens_per_run,
+                        tokens_used=tokens_used,
+                    )
+                    on_event(
+                        "run_end",
+                        actor="agent",
+                        stop_reason=StopReason.BUDGET_EXCEEDED.value,
+                        cycles=cycles,
+                        final_answer=final_answer,
+                        conversation_length=len(messages),
+                    )
+                    return AgentResult(
+                        stop_reason=StopReason.BUDGET_EXCEEDED,
+                        cycles=cycles,
+                        final_answer=final_answer,
+                        conversation=messages,
+                    )
 
             # Only overwrite when the model actually said something. A cycle that
             # is nothing but a tool call would otherwise wipe the last real answer
@@ -669,8 +762,8 @@ def run_agent(
             raise
 
     # Seam 4, Day 1. The normal exit. The others are the returns above -
-    # blocked, and Day 10's truncated, refused, tool_failed and unknown_tool -
-    # and each writes its own run_end. Every run that returns writes
+    # blocked, Day 10's truncated, refused, tool_failed and unknown_tool, and
+    # budget_exceeded - and each writes its own run_end. Every run that returns writes
     # exactly one; a run that raises writes none, which is how the log records
     # that it never finished.
     on_event(
