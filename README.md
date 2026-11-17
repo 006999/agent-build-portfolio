@@ -11,11 +11,12 @@ This is a public subset of a larger private build. The parts that touched real b
 ## What it demonstrates
 
 - **A hand-written agent loop, no framework.** `src/agent.py` sends the request, runs any tools the model asks for, feeds the results back, and repeats until the model signals it is done or a limit is hit.
-- **Every run that returns ends with a named reason.** `src/agent.py` defines `StopReason`: complete, max_cycles, blocked_input, blocked_output, truncated, refused, tool_failed, unknown_tool. `tests/test_agent.py` covers each path with a fake client. An error from the API call or a guardrail is not given a reason: it is logged and raised again.
+- **An optional per-run token budget.** `run_agent(..., max_tokens_per_run=N)` adds up input and output tokens from each reply's usage. A total above N stops the run with `budget_exceeded`. A total equal to N is allowed. It is off by default (`None`). With a budget set, a reply with missing token counts makes the run raise instead of being counted as zero.
+- **Every run that returns ends with a named reason.** `src/agent.py` defines `StopReason`: complete, max_cycles, blocked_input, blocked_output, truncated, refused, tool_failed, unknown_tool, budget_exceeded. `tests/test_agent.py` covers each path with a fake client. An error from the API call or a guardrail is not given a reason: it is logged and raised again.
 - **Input and output guardrails, tested both ways.** `src/guardrails.py` checks the task before the model sees it (empty, oversized, known injection phrases) and checks replies afterwards (banned words). `tests/test_guardrails.py` tests every guardrail with text it must stop and text it must let through, and pins two known misses as tests.
 - **Nothing carries over between runs.** `tests/test_memory.py` checks that a second run sends nothing from the first, writes nothing to disk, and that the invoice tool rereads its file rather than caching it.
 - **An audit log you can rebuild a run from.** `src/audit.py` writes one JSON line per event. `scripts/read_log.py` splits a log file into runs and rebuilds each one. `tests/test_logging.py` compares the rebuild against what the loop actually returned, including for runs that crash.
-- **Tests that are checked against deliberate faults.** `scripts/mutate.py` breaks the code in 43 specific ways, one at a time, and reports which tests went red.
+- **Tests that are checked against deliberate faults.** `scripts/mutate.py` breaks the code in 47 specific ways, one at a time, and reports which tests went red.
 
 ## Run it
 
@@ -32,25 +33,25 @@ Unit tests (no network, no API key, no cost):
 .venv/bin/python -m pytest
 ```
 
-Output on 5 Oct 2026:
+Output on 17 Nov 2026:
 
 ```
-====================== 145 passed, 6 deselected in 0.62s =======================
+====================== 169 passed, 6 deselected in 0.80s =======================
 ```
 
-Mutation harness (28 seconds on the machine it was measured on, one run):
+Mutation harness (71 seconds on the machine it was measured on, one run):
 
 ```bash
 .venv/bin/python scripts/mutate.py
 ```
 
-Output on 5 Oct 2026 (first two and last lines):
+Output on 17 Nov 2026 (first two and last lines):
 
 ```
-baseline: 145 tests
-    145 passed, 6 deselected in 0.37s
+baseline: 169 tests
+    169 passed, 6 deselected in 0.95s
 ...
-43/43 mutations killed.
+47/47 mutations killed.
 ```
 
 Integration tests call the real Anthropic API, so they cost money and are switched off by default (`pytest.ini` filters out the `integration` marker; these are the 6 "deselected"). To run them, put `ANTHROPIC_API_KEY` in a `.env` file and run:
@@ -63,8 +64,8 @@ To watch one run by hand (also calls the API): `.venv/bin/python -m src.run_demo
 
 ## How it is tested
 
-- **145 unit tests**, all using fake clients, so no test touches the network.
-- **Mutation testing.** A passing suite only shows the tests agree with the code. `scripts/mutate.py` copies the project to a temporary folder, applies one deliberate fault (for example "the input guardrails never run" or "the log drops tool arguments"), runs the unit tests, and records which tests failed. A fault no test notices is a gap in the tests. It also checks that every faulty copy ran the same number of tests as the clean one, so a fault that crashes the test run cannot be mistaken for one that was caught. Result on 5 Oct 2026: 43 of 43 faults caught.
+- **169 unit tests**, all using fake clients, so no test touches the network.
+- **Mutation testing.** A passing suite only shows the tests agree with the code. `scripts/mutate.py` copies the project to a temporary folder, applies one deliberate fault (for example "the input guardrails never run" or "the log drops tool arguments"), runs the unit tests, and records which tests failed. A fault no test notices is a gap in the tests. It also checks that every faulty copy ran the same number of tests as the clean one, so a fault that crashes the test run cannot be mistaken for one that was caught. Result on 17 Nov 2026: 47 of 47 faults caught. Four of them break the token budget: the check is never made, a total equal to the budget is treated as over, each reply is compared alone instead of the running total, and missing token counts are treated as zero.
 - **6 integration tests** against the real model. They check that the model picks the right tool from the tool descriptions, that the guardrails work on real replies, and that an unfinishable task stops at the cycle limit. They were not run for this snapshot.
 
 ## Status and limits
@@ -76,10 +77,22 @@ To watch one run by hand (also calls the API): `.venv/bin/python -m src.run_demo
 - The invoice data in `data/invoices.csv` is invented.
 - `scripts/read_log.py` contains code for reading document events written by a workflow in the private build. That code is untested in this public copy.
 - `src/guardrails.py` contains a draft-length guardrail (`DRAFT_NOT_OVERSIZED`, `DRAFT_GUARDRAILS`) used only by that same workflow. It is also untested in this public copy.
-- The cycle limit bounds how many steps a run takes, not how much it costs. Token counts are logged per cycle, but nothing enforces a token budget yet.
+- The cycle limit bounds how many steps a run takes, not how much it costs. The token budget bounds cost only when a caller sets one; it is off by default.
+
+## Limits
+
+What the token budget change does not prove:
+
+- It runs locally, not in production. Nothing is deployed.
+- The integration tests need an API key and cost money. They were not run for this change. The budget has only been tested against the fake client, never against real usage numbers from the API.
+- The budget is checked after each reply, so a run can go over it by up to one reply's tokens. The loop cannot know what a reply costs before it arrives.
+- It counts `input_tokens` and `output_tokens` only. The real usage object also has `cache_read_input_tokens` and `cache_creation_input_tokens`, which are not counted. This loop does not use prompt caching, but a caller who adds it would see the budget undercount. Tokens spent inside a tool that makes its own model request are not seen either.
+- A reply with missing counts makes the run raise ValueError. A reply with no usage object at all raises AttributeError earlier, from the reply event, with or without a budget. That second path is old behaviour, pinned by a test, and was not redesigned.
+- The budget value is not written to the `run_start` event. A run that stays inside its budget leaves no record in the log of what the budget was. Only a run that goes over writes it, in the `budget_exceeded` event.
+- The document-event code in `scripts/read_log.py` and the draft-length guardrail are still untested, as before.
 
 ## What I would do next
 
-- Enforce a per-run token budget using the token counts the log already records.
+- Write the budget into `run_start`, so every run's log shows its limit.
 - Add tests for the read_log document-event code and the draft guardrail, or remove that code from this copy.
 - Run the integration tests on a schedule against a fixed small budget, and record their results next to the unit-test results.
