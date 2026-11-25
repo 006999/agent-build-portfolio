@@ -11,6 +11,7 @@ from fakes import (
     FakeTextBlock,
     FakeTool,
     FakeToolUseBlock,
+    FakeUsage,
 )
 
 from src.agent import (
@@ -51,6 +52,8 @@ def test_stop_reason_is_a_fixed_set_not_free_text():
         # Day 10, deliberately: a tool that raised, and a tool nobody registered.
         "TOOL_FAILED",
         "UNKNOWN_TOOL",
+        # Token budget, deliberately: a run that went over max_tokens_per_run.
+        "BUDGET_EXCEEDED",
     }
 
 
@@ -809,6 +812,208 @@ def test_a_truncated_reply_that_trips_the_output_guardrail_is_blocked_not_trunca
     assert result.stop_reason is StopReason.BLOCKED_OUTPUT
     assert result.blocked_by == "no_wibbling"
     assert guard.seen == ["we shall wibble the bl"]
+
+
+# --- Token budget: max_tokens_per_run ----------------------------------------
+#
+# The fake client hands back input = 1000 + n and output = 10 + n on call n,
+# counting from 1 (tests/fakes.py, FakeMessages._usage_for_call), so the
+# running totals are 1012 after one reply, 2026 after two and 3042 after three.
+# Every budget below is chosen against those numbers. Output alone is 11, 23,
+# 36: a loop that counted only output tokens would never reach these budgets,
+# and a loop that compared one reply instead of the running total would never
+# pass 1016.
+
+
+def test_budget_off_by_default_never_stops_the_run():
+    """No budget set: three replies, 3042 tokens, and the run is not stopped."""
+    client = FakeClient()
+    result = run_agent("anything", max_cycles=3, client=client)
+
+    assert result.stop_reason is StopReason.MAX_CYCLES
+    assert len(client.messages.calls) == 3
+    assert sum(i + o for i, o in client.messages.usages) == 3042
+
+
+def test_budget_none_is_the_same_as_leaving_it_out():
+    def replies():
+        return [[FakeToolUseBlock("roll_dice", {})], "Thinking.", "done\nTASK_COMPLETE"]
+
+    bare_client = FakeClient(replies())
+    bare = run_agent("roll", tools=[FakeTool()], client=bare_client)
+    off_client = FakeClient(replies())
+    off = run_agent("roll", tools=[FakeTool()], client=off_client, max_tokens_per_run=None)
+
+    assert off.stop_reason is bare.stop_reason is StopReason.COMPLETE
+    assert off.cycles == bare.cycles == 3
+    assert off.final_answer == bare.final_answer
+    assert off.conversation == bare.conversation
+    assert off_client.messages.calls == bare_client.messages.calls
+
+
+def test_under_budget_the_run_is_unchanged():
+    """3042 tokens used against a budget of 3043. Same result as no budget."""
+    def replies():
+        return [[FakeToolUseBlock("roll_dice", {})], "Thinking.", "done\nTASK_COMPLETE"]
+
+    bare = run_agent("roll", tools=[FakeTool()], client=FakeClient(replies()))
+    budget_client = FakeClient(replies())
+    budgeted = run_agent(
+        "roll", tools=[FakeTool()], client=budget_client, max_tokens_per_run=3043
+    )
+
+    assert budgeted.stop_reason is StopReason.COMPLETE
+    assert budgeted.cycles == bare.cycles == 3
+    assert budgeted.final_answer == bare.final_answer == "done"
+    assert budgeted.conversation == bare.conversation
+
+
+def test_exactly_at_budget_the_run_is_allowed_to_complete():
+    """2026 tokens used against a budget of 2026. At the budget is not over it."""
+    client = FakeClient(["Thinking.", "done\nTASK_COMPLETE"])
+
+    result = run_agent("anything", client=client, max_tokens_per_run=2026)
+
+    assert result.stop_reason is StopReason.COMPLETE
+    assert result.cycles == 2
+    assert result.final_answer == "done"
+
+
+def test_exactly_at_budget_the_run_carries_on_and_the_next_reply_stops_it():
+    """1012 after one reply is at a budget of 1012, so the loop nudges and asks
+    again. The second reply takes the total to 2026, which is over."""
+    client = FakeClient(["Thinking.", "done\nTASK_COMPLETE"])
+
+    result = run_agent("anything", client=client, max_tokens_per_run=1012)
+
+    assert result.stop_reason is StopReason.BUDGET_EXCEEDED
+    assert result.cycles == 2
+    assert len(client.messages.calls) == 2
+
+
+def test_over_budget_stops_the_run_on_the_reply_that_crossed_it():
+    """2026 after two replies against 2025. Stops at cycle 2, no third call."""
+    client = FakeClient(["A clean first answer.", "Still going.", "done\nTASK_COMPLETE"])
+
+    result = run_agent("anything", client=client, max_tokens_per_run=2025)
+
+    assert result.stop_reason is StopReason.BUDGET_EXCEEDED
+    assert result.cycles == 2
+    assert len(client.messages.calls) == 2
+    # The reply that went over is on record but is not the answer.
+    assert result.final_answer == "A clean first answer."
+    texts = [b["text"] for b in _blocks_of_type(result.conversation, "text")]
+    assert texts[-1] == "Still going."
+    # Not nudged after the stop.
+    assert result.conversation[-1]["role"] == "assistant"
+    assert result.blocked_by is None
+    assert result.failed_tool is None
+
+
+def test_over_budget_on_the_first_reply_stops_at_cycle_one():
+    client = FakeClient(["done\nTASK_COMPLETE"])
+
+    result = run_agent("anything", client=client, max_tokens_per_run=1011)
+
+    # Over budget beats the sentinel: the reply cannot claim completion.
+    assert result.stop_reason is StopReason.BUDGET_EXCEEDED
+    assert result.cycles == 1
+    assert result.final_answer == ""
+
+
+def test_an_over_budget_reply_does_not_run_its_tool():
+    tool = FakeTool("roll_dice")
+    client = FakeClient([[FakeToolUseBlock("roll_dice", {"sides": 6})]])
+
+    result = run_agent("roll", tools=[tool], client=client, max_tokens_per_run=1011)
+
+    assert result.stop_reason is StopReason.BUDGET_EXCEEDED
+    assert tool.calls == []
+
+
+def test_an_over_budget_reply_that_is_also_truncated_reports_truncated():
+    """Precedence: the more specific stop wins over the budget."""
+    client = FakeClient([FakeResponse("cut off mid", stop_reason="max_tokens")])
+
+    result = run_agent("anything", client=client, max_tokens_per_run=1011)
+
+    assert result.stop_reason is StopReason.TRUNCATED
+
+
+def test_the_budget_counts_input_and_output_from_scripted_usage():
+    """Independent of the fake's formula: 600 + 0, then 0 + 500 = 1100 > 1000."""
+    client = FakeClient(
+        [
+            FakeResponse("Thinking.", usage=FakeUsage(600, 0)),
+            FakeResponse("Still going.", usage=FakeUsage(0, 500)),
+            "done\nTASK_COMPLETE",
+        ]
+    )
+
+    result = run_agent("anything", client=client, max_tokens_per_run=1000)
+
+    assert result.stop_reason is StopReason.BUDGET_EXCEEDED
+    assert result.cycles == 2
+
+
+@pytest.mark.parametrize("bad", [0, -5, True, "5000", 2.5])
+def test_a_bad_budget_value_is_rejected_before_anything_is_sent(bad):
+    client = FakeClient(["done\nTASK_COMPLETE"])
+
+    with pytest.raises(ValueError, match="max_tokens_per_run"):
+        run_agent("anything", client=client, max_tokens_per_run=bad)
+
+    assert client.messages.calls == []
+
+
+# Missing usage. The decision: with a budget set, a reply whose token counts
+# are missing fails closed. The loop does not treat it as zero tokens and carry
+# on, because then a budget would silently stop working on exactly the replies
+# it cannot see. It raises ValueError, which the loop logs as an error event and
+# re-raises. With no budget set, nothing changes from before.
+
+
+@pytest.mark.parametrize(
+    "usage",
+    [FakeUsage(None, None), FakeUsage(1000, None), FakeUsage(None, 10)],
+)
+def test_missing_token_counts_with_a_budget_raise_rather_than_count_as_zero(usage):
+    client = FakeClient(
+        [FakeResponse("Thinking.", usage=usage), "done\nTASK_COMPLETE"]
+    )
+
+    with pytest.raises(ValueError, match="cannot enforce max_tokens_per_run"):
+        run_agent("anything", client=client, max_tokens_per_run=1_000_000)
+
+    # Stopped at the reply it could not count. No second request.
+    assert len(client.messages.calls) == 1
+
+
+def test_missing_token_counts_without_a_budget_change_nothing():
+    """Positive control for the test above: budget off, the same reply is fine."""
+    client = FakeClient(
+        [FakeResponse("Thinking.", usage=FakeUsage(None, None)), "done\nTASK_COMPLETE"]
+    )
+
+    result = run_agent("anything", client=client)
+
+    assert result.stop_reason is StopReason.COMPLETE
+    assert result.cycles == 2
+
+
+def test_no_usage_object_at_all_crashes_the_run_with_or_without_a_budget():
+    """Pins existing behaviour, not new behaviour.
+
+    The reply event reads response.usage.input_tokens before the budget check
+    runs, so a reply with usage=None raises AttributeError there, budget or
+    not. That was already true before the budget existed and is left alone so
+    that "budget off" stays unchanged. It still fails closed.
+    """
+    for budget in (None, 1_000_000):
+        client = FakeClient([FakeResponse("Thinking.", usage=None), "done\nTASK_COMPLETE"])
+        with pytest.raises(AttributeError):
+            run_agent("anything", client=client, max_tokens_per_run=budget)
+        assert len(client.messages.calls) == 1
 
 
 @pytest.mark.integration

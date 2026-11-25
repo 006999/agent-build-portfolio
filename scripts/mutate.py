@@ -664,6 +664,58 @@ MUTATIONS += [
 ]
 
 
+
+# ---------------------------------------------------------------------------
+# Token budget. Each fault leaves the budget looking switched on while it
+# fails to stop a run it should stop, stops one it should not, or lets a reply
+# it cannot count through for free.
+# ---------------------------------------------------------------------------
+
+MUTATIONS += [
+    (
+        "budget: the check is never made",
+        lambda work: mutate_source(
+            work,
+            "agent.py",
+            "                if tokens_used > max_tokens_per_run:",
+            "                if False:",
+        ),
+    ),
+    (
+        "budget: a total equal to the budget is treated as over",
+        lambda work: mutate_source(
+            work,
+            "agent.py",
+            "                if tokens_used > max_tokens_per_run:",
+            "                if tokens_used >= max_tokens_per_run:",
+        ),
+    ),
+    (
+        "budget: each reply is compared alone, not the running total",
+        lambda work: mutate_source(
+            work,
+            "agent.py",
+            "                tokens_used += _reply_tokens(response)",
+            "                tokens_used = _reply_tokens(response)",
+        ),
+    ),
+    (
+        "budget: a reply with missing counts is counted as zero",
+        # The tempting "robust" fix: never crash on a bad usage object. The
+        # budget then silently stops working on exactly the replies it cannot
+        # see.
+        lambda work: mutate_source(
+            work,
+            "agent.py",
+            "        if not isinstance(count, int) or isinstance(count, bool) or count < 0:\n"
+            "            raise ValueError(",
+            "        if not isinstance(count, int) or isinstance(count, bool) or count < 0:\n"
+            "            return 0\n"
+            "            raise ValueError(",
+        ),
+    ),
+]
+
 def main() -> int:
     wanted = sys.argv[1] if len(sys.argv) > 1 else ""
     selected = [(label, apply) for label, apply in MUTATIONS if wanted in label]

@@ -31,6 +31,7 @@ from fakes import (
     FakeTextBlock,
     FakeTool,
     FakeToolUseBlock,
+    FakeUsage,
 )
 
 from scripts import read_log
@@ -346,6 +347,59 @@ def test_a_reply_the_loop_cannot_act_on_is_recorded_before_the_run_ends(
     assert last_reply["content"] == [
         {"type": "text", "text": "The blockers are: first, the unres"}
     ]
+
+
+def test_a_run_over_its_token_budget_is_recorded_exactly(tmp_path):
+    """Token budget. A tool cycle, then the reply that crosses the budget.
+
+    The fake's running total is 1012 after one reply and 2026 after two, so a
+    budget of 2025 is crossed on cycle 2. The budget_exceeded event comes after
+    the reply event that carries the counts, and before run_end.
+    """
+    client = FakeClient(
+        [
+            [FakeToolUseBlock("roll_dice", {"sides": 20})],
+            "The total is 4.\nTASK_COMPLETE",
+        ]
+    )
+    result, log, _ = _run(
+        tmp_path,
+        task="Roll, then write it up.",
+        tools=[FakeTool(result="rolled a 4")],
+        client=client,
+        max_tokens_per_run=2025,
+    )
+
+    assert result.stop_reason is StopReason.BUDGET_EXCEEDED
+    _assert_log_matches(result, client, log)
+
+    assert log.event_types == [
+        "run_start",
+        "request",
+        "reply",
+        "tool_result",
+        "request",
+        "reply",
+        "budget_exceeded",
+        "run_end",
+    ]
+    assert log.budget == {"max_tokens_per_run": 2025, "tokens_used": 2026, "cycle": 2}
+    # The total in the event agrees with the per-reply counts in the same log,
+    # and both agree with what the fake actually handed back.
+    assert log.budget["tokens_used"] == sum(i + o for i, o in log.tokens)
+    assert log.budget["tokens_used"] == sum(i + o for i, o in client.messages.usages)
+
+
+def test_a_run_inside_its_token_budget_writes_no_budget_event(tmp_path):
+    client = FakeClient(["done\nTASK_COMPLETE"])
+    result, log, _ = _run(
+        tmp_path, task="Say done.", client=client, max_tokens_per_run=1012
+    )
+
+    assert result.stop_reason is StopReason.COMPLETE
+    _assert_log_matches(result, client, log)
+    assert "budget_exceeded" not in log.event_types
+    assert log.budget is None
 
 
 def test_the_two_block_types_do_not_produce_the_same_events(tmp_path):
@@ -996,3 +1050,46 @@ def test_a_tool_failure_is_printed(tmp_path, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "tool failed:  roll_dice - RuntimeError: the tool exploded" in out
     assert "stop reason:  tool_failed" in out
+
+
+def test_missing_token_counts_with_a_budget_are_recorded_as_a_crash(tmp_path):
+    """Token budget, fail-closed path. The reply event is written first, with
+    the missing counts as null, then the error naming the budget. No run_end."""
+    client = FakeClient(
+        [FakeResponse("Thinking.", usage=FakeUsage(None, None)), "done\nTASK_COMPLETE"]
+    )
+    path = tmp_path / "run.jsonl"
+
+    with pytest.raises(ValueError, match="max_tokens_per_run") as exc_info:
+        run_agent(
+            "Do something.",
+            client=client,
+            on_event=JsonlLogger(path),
+            max_tokens_per_run=1_000_000,
+        )
+
+    log = parse(path)
+    _assert_crash_log(
+        log,
+        exc_info,
+        expected_types=["run_start", "request", "reply", "error"],
+        calls_made=len(client.messages.calls),
+    )
+    assert log.tokens == [(None, None)] == client.messages.usages
+
+
+def test_a_budget_stop_is_printed(tmp_path, monkeypatch, capsys):
+    path = tmp_path / "run.jsonl"
+    run_agent(
+        "Say done.",
+        client=FakeClient(["done\nTASK_COMPLETE"]),
+        on_event=JsonlLogger(path),
+        max_tokens_per_run=1011,
+    )
+    monkeypatch.setattr("sys.argv", ["read_log.py", str(path)])
+
+    read_log.main()
+
+    out = capsys.readouterr().out
+    assert "over budget:  1012 tokens used, budget 1011" in out
+    assert "stop reason:  budget_exceeded" in out

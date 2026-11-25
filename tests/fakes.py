@@ -50,6 +50,11 @@ class FakeStopDetails:
         self.category = category
 
 
+# Marks "no usage was scripted". A sentinel rather than None, because None is
+# one of the values a test needs to be able to script.
+_DERIVED_USAGE = object()
+
+
 class FakeResponse:
     def __init__(
         self,
@@ -58,8 +63,18 @@ class FakeResponse:
         output_tokens: int = 0,
         stop_reason: str | None = None,
         stop_details=None,
+        usage=_DERIVED_USAGE,
     ):
-        """A reply is either a string of text or a ready-made list of blocks."""
+        """A reply is either a string of text or a ready-made list of blocks.
+
+        `usage` is the token-budget addition. Left out, nothing changes: the
+        usage is built from the two counts and FakeMessages overwrites it with
+        its own per-call numbers, exactly as before. Passed in - a FakeUsage
+        with chosen counts, one with a count of None, or None for no usage at
+        all - it is kept as given, because the budget has to be tested against
+        a reply whose usage is missing and this fake could not otherwise return
+        one.
+        """
         if isinstance(reply, str):
             self.content = [FakeTextBlock(reply)]
         else:
@@ -81,7 +96,8 @@ class FakeResponse:
             self.stop_reason = "tool_use" if has_tool_use else "end_turn"
 
         self.stop_details = stop_details
-        self.usage = FakeUsage(input_tokens, output_tokens)
+        self.usage_scripted = usage is not _DERIVED_USAGE
+        self.usage = usage if self.usage_scripted else FakeUsage(input_tokens, output_tokens)
 
 
 class FakeMessages:
@@ -128,6 +144,16 @@ class FakeMessages:
             # Its usage is filled in here so the token ground truth in
             # `self.usages` stays the single record of what was handed back.
             if isinstance(reply, FakeResponse):
+                if reply.usage_scripted:
+                    # Kept as scripted. The derived pair recorded above is
+                    # replaced with what is actually handed back, so `usages`
+                    # stays true - (None, None) when there is no usage at all.
+                    usage = reply.usage
+                    self.usages[-1] = (
+                        getattr(usage, "input_tokens", None),
+                        getattr(usage, "output_tokens", None),
+                    )
+                    return reply
                 reply.usage = FakeUsage(input_tokens, output_tokens)
                 return reply
             return FakeResponse(

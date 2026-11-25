@@ -67,6 +67,9 @@ class RunLog:
     error: dict | None = None
     # Day 10. The tool_failed or tool_unknown event, minus the envelope fields.
     tool_failure: dict | None = None
+    # Token budget. The budget_exceeded event, minus the envelope fields. None
+    # when the run had no budget or stayed inside it.
+    budget: dict | None = None
 
     # Day 10. How many replies came back with each api_stop_reason, in the
     # order each reason first appeared. The loop's replies and the document
@@ -269,6 +272,13 @@ def _rebuild(events: list[dict]) -> RunLog:
             log.failed_tool = event["name"]
             log.failure_reason = f"{event['name']!r} is not a registered tool"
 
+        elif kind == "budget_exceeded":
+            log.budget = {
+                "max_tokens_per_run": event["max_tokens_per_run"],
+                "tokens_used": event["tokens_used"],
+                "cycle": event["cycle"],
+            }
+
         elif kind == "completion_check":
             if event["nudge"] is not None:
                 log.conversation.append({"role": "user", "content": event["nudge"]})
@@ -394,6 +404,11 @@ def main() -> int:
             print(f"error:        {log.error['exception_type']}: {log.error['message']}")
         if log.tool_failure is not None:
             print(f"tool failed:  {log.failed_tool} - {log.failure_reason}")
+        if log.budget is not None:
+            print(
+                f"over budget:  {log.budget['tokens_used']} tokens used, "
+                f"budget {log.budget['max_tokens_per_run']}"
+            )
         print("tools called:")
         for call in log.tool_calls:
             print(f"  {call['name']}({call['args']}) -> {call['result']}")
